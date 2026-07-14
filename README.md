@@ -34,7 +34,7 @@ vpad 提供基础编辑能力：
 - 简单文本修改；
 - CJK 标点与字符输入修正。
 
-
+#### :!vim % 允许直接切换入Vim,在 Vim 内，:wq 退出后会回到 vpad
 对于复杂文本操作：
 - 正则表达式批量处理；
 - 宏录制；
@@ -84,3 +84,6 @@ vpad is not intended to replace Vim. Instead, it works together with Vim:
 - Vim handles advanced text processing such as regular expressions, macros, and large-scale modifications.
 
 By combining both tools, users can maintain a terminal-based workflow while gaining a better environment for CJK text processing.
+
+### 使用图实例
+<img width="1260" height="1328" alt="image" src="https://github.com/user-attachments/assets/d06bbf7f-c3af-449c-b8ea-5d6aac9d0efd" />

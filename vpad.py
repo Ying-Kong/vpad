@@ -4,15 +4,46 @@ import sys
 import os
 import unicodedata
 
+"""
+专为中日韩（CJK）设计的终端交互式竖排轻量编辑器，
+模仿 Vim 逻辑设计，可以与 Vim 无缝衔接, 利用其正则、宏处理等进行大段文字编辑任务，
+vpad 本身提供轻量的竖版编辑环境，同时支持简单的文字修改。
+本编辑器不支持半角英文、拼音等，所有字母全部为全角、大写显示，数字也以全角显示。
+"""
+
 # 全局直排符号映射字典
 VERTICAL_MAP = {
-    '（': '︵', '）': '︶', '(': '︵', ')': '︶',
-    '《': '︽', '》': '︾', '〈': '︿', '〉': '﹀',
-    '【': '︻', '】': '︼', '[': '︻', ']': '︼',
-    '“': '﹁', '”': '﹂', '‘': '﹃', '’': '﹄',
-    '「': '﹁', '」': '﹂', '『': '﹃', '』': '﹄',
-    '—': '︱', '_': '︳', '…': '︙'
+    # 全角符映射
+    '（': '︵', '）': '︶', '《': '︽',
+    '》': '︾', '【': '︻', '】': '︼',
+    '“': '﹁', '”': '﹂', '‘': '﹃',
+    '’': '﹄', '「': '﹁', '」': '﹂',
+    '『': '﹃', '』': '﹄', '—': '︱',
+    '_': '︳', '…': '︙',
+    # 半角符映射
+    '〈': '︿', '〉': '﹀', '(': '︵',
+    ')': '︶', '[': '︻', ']': '︼'
 }
+
+HALF_TO_FULL_PUNC = {
+    # 破折号和省略号处理比较复杂，先基础映射
+    ',': '，', '.': '。', '!': '！', '?': '？',
+    ':': '：', ';': '；', '(': '（', ')': '）',
+    '<': '《', '>': '》', '[': '【', ']': '】',
+    '{': '｛', '}': '｝', '\\': '＼', '/': '／',
+    '^': '……', '-' : '——'
+}
+
+# 头禁则
+FORBIDDEN_START = {
+    '，', '。', '！', '？', '：', '；', '”', '’', '）', '》', '】', '…', '、',
+    ',', '.', '!', '?', ':', ';', '"', "'", ')', '>', ']'
+}
+# 尾禁则
+FORBIDDEN_END = {
+    '（', '《', '〈', '【', '“', '‘', '(', '<', '[', '{'
+}
+
 for i in range(10): VERTICAL_MAP[str(i)] = chr(ord('０') + i)
 for i in range(26):
     VERTICAL_MAP[chr(ord('a') + i)] = chr(ord('ａ') + i)
@@ -38,15 +69,6 @@ def update_paragraph_layout(para, max_h):
         para.cached_grid, para.cached_l2v, para.cached_v2l = grid, l2v, v2l
         para.is_dirty = False
         return
-
-    FORBIDDEN_START = {
-        '，', '。', '！', '？', '：', '；', '”', '’', '）', '》', '】', '…', '、',
-        ',', '.', '!', '?', ':', ';', '"', "'", ')', '>', ']'
-    }
-    FORBIDDEN_END = {
-        '（', '《', '〈', '【', '“', '‘',
-        '(', '<', '[', '{'
-    }
 
     stream = [(char, c_idx) for c_idx, char in enumerate(para.chars)]
     stream.append(('\n', len(para.chars)))
@@ -201,6 +223,95 @@ def render_status_bar(stdscr, max_y, max_x, text, attr):
         pass
 
 
+def get_char_type(char):
+    """
+    判断字符类型，用于驱动状态机切换，返回 CJK (中日韩), LATIN (字母数字), 或 PUNC (标点符号等)
+    """
+    if not char.strip():
+        return 'SPACE'
+    category = unicodedata.category(char)
+    # 如本身已经是标点，不改变语言上下文
+    if category.startswith('P'):
+        return 'PUNC'
+    code = ord(char)
+    if (0x4E00 <= code <= 0x9FFF) or (0x3400 <= code <= 0x4DBF):
+        return 'CJK'
+    if category.startswith('L') or category.startswith('N'):
+        return 'LATIN'
+    return 'UNKNOWN'
+
+
+def auto_correct_punctuation(document):
+    """
+    智能全量标点修正算法，返回修改了多少处，用于状态栏提示
+    """
+    # 默认全局上下文为中文，这符合你写小说的场景
+    current_context = 'CJK'
+
+    # 引号状态：False 表示目前不在引号内（期待左引号），True 表示在引号内（期待右引号）
+    in_double_quote = False
+    in_single_quote = False
+
+    changes_count = 0
+
+    for para in document:
+        # 跨段落时，如果遇到未闭合的引号，强制闭合，防止引号翻转波及全书
+        # in_double_quote = False
+        # in_single_quote = False
+
+        # 预留一个标记，如果本段被修改了，等下要把 is_dirty 设为 True
+        para_changed = False
+
+        for i in range(len(para.chars)):
+            char = para.chars[i]
+
+            # 1. 嗅探并更新语言上下文（遇到标点不更新上下文）
+            ctype = get_char_type(char)
+            if ctype == 'CJK':
+                current_context = 'CJK'
+            elif ctype == 'LATIN':
+                current_context = 'LATIN'
+
+            # 2. 如果当前处于中文上下文，并且遇到了半角标点，进行拦截和转换
+            if current_context == 'CJK':
+                new_char = char
+
+                # 处理基础标点
+                if char == '.' and i > 0 and (para.chars[i - 1] == '。' or para.chars[i - 1] == '.'):
+                    # 处理连续句号逻辑（例如合并为 '…'）
+                    pass
+                elif char in HALF_TO_FULL_PUNC:
+                    new_char = HALF_TO_FULL_PUNC[char]
+
+                # 处理棘手的引号
+                elif char == '"':
+                    if not in_double_quote:
+                        new_char = '“'
+                        in_double_quote = True
+                    else:
+                        new_char = '”'
+                        in_double_quote = False
+                elif char == "'":
+                    if not in_single_quote:
+                        new_char = '‘'
+                        in_single_quote = True
+                    else:
+                        new_char = '’'
+                        in_single_quote = False
+
+                # 3. 提交修改
+                if new_char != char:
+                    para.chars[i] = new_char
+                    para_changed = True
+                    changes_count += 1
+
+        # 只要段落被动过，就打上脏标记，下次 build_global_layout 就会重绘
+        if para_changed:
+            para.is_dirty = True
+
+    return changes_count
+
+
 def main(stdscr):
     locale.setlocale(locale.LC_ALL, '')
     curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
@@ -214,7 +325,7 @@ def main(stdscr):
 
     filename = sys.argv[1] if len(sys.argv) > 1 else "untitled.txt"
     document = load_document(filename)
-
+    command_buffer = ""
     cur_col, cur_row, desired_row, camera_col = 0, 0, 0, 0
     current_mode, last_mode = "NORMAL", None
     status_msg, status_timer = "", 0
@@ -250,9 +361,12 @@ def main(stdscr):
         if status_msg and status_timer > 0:
             info_str = f" {status_msg} "
             status_timer -= 1
+        elif current_mode == "COMMAND":
+            info_str = f" COMMAND: {command_buffer} "
+            attr = curses.A_REVERSE | curses.A_BOLD
         else:
             mode_str = "[NORMAL]" if current_mode == "NORMAL" else "[INSERT]"
-            info_str = f" {mode_str} {filename} | 视窗({cur_col},{cur_row}) | [u]撤销 [F2]保存 "
+            info_str = f" {mode_str} {filename} | 窗口({cur_col},{cur_row}) | [u]撤销 [F2]保存 "
 
         render_status_bar(stdscr, max_y, max_x, info_str,
                           curses.A_REVERSE | curses.A_BOLD if current_mode == "INSERT" else curses.A_REVERSE)
@@ -284,6 +398,7 @@ def main(stdscr):
                 pass
 
         if current_mode != last_mode:
+            # noinspection PyBroadException
             try:
                 curses.curs_set(2 if current_mode == "NORMAL" else 1)
             except:
@@ -329,10 +444,20 @@ def main(stdscr):
             if isinstance(char, str):
                 if char in ('i', 'a', 'I', 'A'):
                     save_undo_snapshot(document, cur_col, cur_row, undo_stack)
+                    if char == "a":
+                        move_cursor(0, 1)
+                    elif char == "A":
+                        pass
                     current_mode = "INSERT"
                 elif ord(char) == 27:
-                    save_document(document, filename)
-                    break
+                # ESC 键只清空状态，不保存、退出文件
+                    status_msg, status_timer = "", 0
+                    g_pressed = False
+                # : 进入底部命令模式
+                elif char == ':':
+                    # status_msg, status_timer = "进入命令模式", 10
+                    current_mode = "COMMAND"
+                    command_buffer = ""
                 elif char == 'j': move_cursor(0, 1)
                 elif char == 'k': move_cursor(0, -1)
                 elif char == 'h': move_cursor(1, 0)
@@ -341,7 +466,7 @@ def main(stdscr):
                     if undo_stack:
                         doc_snap, cur_col, cur_row = undo_stack.pop()
                         document = [Paragraph(para.chars[:]) for para in doc_snap]
-                        desired_row, status_msg, status_timer = cur_row, "[已还原上一步修改]", 2
+                        desired_row, status_msg, status_timer = cur_row, "「已还原上一步修改」", 2
                 elif char == 'g':
                     if g_pressed: move_cursor(0, 0, True); g_pressed = False
                     else: g_pressed = True
@@ -351,12 +476,68 @@ def main(stdscr):
                     move_cursor(target_c, target_r, True)
             elif isinstance(char, int):
                 if char == curses.KEY_DOWN: move_cursor(0, 1)
+                elif char == curses.KEY_F5:
+                    save_undo_snapshot(document, cur_col, cur_row, undo_stack)
+                    fixed_count = auto_correct_punctuation(document)
+                    status_msg = f"「{fixed_count} 个半角标点已转为全角」"
+                    status_timer = 4
                 elif char == curses.KEY_UP: move_cursor(0, -1)
                 elif char == curses.KEY_LEFT: move_cursor(1, 0)
                 elif char == curses.KEY_RIGHT: move_cursor(-1, 0)
                 elif char == curses.KEY_NPAGE: move_cursor(min(len(text_grid) - 1, cur_col + max_visible_cols), cur_row, True)
                 elif char == curses.KEY_PPAGE: move_cursor(max(0, cur_col - max_visible_cols), cur_row, True)
             if reset_g_flag: g_pressed = False
+
+        elif current_mode == "COMMAND":
+            if isinstance(char, int):
+                if char in (curses.KEY_BACKSPACE, 127):
+                    if len(command_buffer) > 0:
+                        command_buffer = command_buffer[:-1]
+                    else:
+                        current_mode = "NORMAL"  # 删空了自动退回 NORMAL
+            elif isinstance(char, str):
+                if ord(char) == 27:  # ESC 键放弃命令
+                    current_mode = "NORMAL"
+                elif char in ('\b', '\x7f'):
+                    if len(command_buffer) > 0:
+                        command_buffer = command_buffer[:-1]
+                    else:
+                        current_mode = "NORMAL"
+                elif char in ('\n', '\r'):  # 按下回车，执行命令
+                    cmd = command_buffer.strip()
+                    if cmd == 'q':
+                        # 检查 document 是否 dirty，但偷个小懒直接退，以后再处理
+                        break
+                    elif cmd == 'w':
+                        save_document(document, filename)
+                        status_msg, status_timer = "「已保存」", 3
+                        current_mode = "NORMAL"
+                    elif cmd == 'wq':
+                        save_document(document, filename)
+                        break
+                    elif cmd == 'q!':
+                        break
+                    elif cmd.startswith('!'):
+                        shell_cmd = cmd[1:].strip()
+                        shell_cmd = shell_cmd.replace('%', filename)
+
+                        # 强制保存，确保 Vim 读取最新文件
+                        save_document(document, filename)
+                        # 挂起 vpad 的 curses 界面
+                        curses.endwin()
+                        # 阻塞执行 Vim, vpad 进程会在这里停滞，直到在 Vim 里执行 :wq 退出
+                        os.system(shell_cmd)
+                        # Vim 退出后，vpad 重新接管终端并清空屏幕
+                        stdscr.clear()
+                        stdscr.refresh()
+                        document = load_document(filename)
+                        status_msg, status_timer = f"「已同步 {shell_cmd.split()[0]} 的修改」", 3
+                        current_mode = "NORMAL"
+                    else:
+                        status_msg, status_timer = f"「未知命令: {cmd}」", 3
+                        current_mode = "NORMAL"
+                else:
+                    command_buffer += char
 
         elif current_mode == "INSERT":
             if isinstance(char, int):
@@ -373,7 +554,7 @@ def main(stdscr):
                     logical_pos = v2l.get((cur_col, cur_row))
                     if logical_pos:
                         p_idx, c_idx = logical_pos
-                        save_undo_snapshot(document, cur_col, cur_row, undo_stack)
+                        # save_undo_snapshot(document, cur_col, cur_row, undo_stack)
 
                         if char in ('\n', '\r'):
                             # 拆分段落

@@ -3,6 +3,7 @@ import locale
 import sys
 import os
 import unicodedata
+from core_vpad import VpadSandbox
 
 """
 专为中日韩（CJK）设计的终端交互式竖排轻量编辑器，
@@ -234,7 +235,13 @@ def get_char_type(char):
     if category.startswith('P'):
         return 'PUNC'
     code = ord(char)
-    if (0x4E00 <= code <= 0x9FFF) or (0x3400 <= code <= 0x4DBF):
+    # 汉字 (中日韩统一表意文字)
+    is_han = (0x4E00 <= code <= 0x9FFF) or (0x3400 <= code <= 0x4DBF)
+    # 日文 (平假名: 3040-309F, 片假名: 30A0-30FF)
+    is_kana = (0x3040 <= code <= 0x309F) or (0x30A0 <= code <= 0x30FF)
+    # 朝韩文 (谚文音节: AC00-D7AF, 谚文兼容字母: 3130-318F)
+    is_hangul = (0xAC00 <= code <= 0xD7AF) or (0x3130 <= code <= 0x318F)
+    if is_han or is_kana or is_hangul:
         return 'CJK'
     if category.startswith('L') or category.startswith('N'):
         return 'LATIN'
@@ -256,8 +263,8 @@ def auto_correct_punctuation(document):
 
     for para in document:
         # 跨段落时，如果遇到未闭合的引号，强制闭合，防止引号翻转波及全书
-        # in_double_quote = False
-        # in_single_quote = False
+        in_double_quote = False
+        in_single_quote = False
 
         # 预留一个标记，如果本段被修改了，等下要把 is_dirty 设为 True
         para_changed = False
@@ -322,9 +329,25 @@ def main(stdscr):
     stdscr.keypad(True)
     stdscr.nodelay(False)
     stdscr.scrollok(False)
+    # filename = sys.argv[1] if len(sys.argv) > 1 else "untitled.txt"
+    # document = load_document(filename)
+    vpad_filename = sys.argv[1] if len(sys.argv) > 1 else "untitled.vpad"
+    sandbox = VpadSandbox(vpad_filename)
 
-    filename = sys.argv[1] if len(sys.argv) > 1 else "untitled.txt"
-    document = load_document(filename)
+    try:
+        config_data, json_state = sandbox.mount()
+    except Exception as e:
+        stdscr.addstr(0, 0, f"「启动失败」{e}", curses.color_pair(1))
+        stdscr.refresh()
+        stdscr.getch()
+        return
+
+    # 从沙盒内暴露的 TXT 文件路径读取文件
+    document = load_document(sandbox.get_bak_path())
+    init_p_idx = json_state.get("p_idx", 0)
+    init_c_idx = json_state.get("c_idx", 0)
+    cursor_restored = False
+
     command_buffer = ""
     cur_col, cur_row, desired_row, camera_col = 0, 0, 0, 0
     current_mode, last_mode = "NORMAL", None
@@ -344,7 +367,19 @@ def main(stdscr):
 
         text_grid, l2v, v2l = build_global_layout(document, usable_height)
 
-        if (cur_col, cur_row) not in v2l:
+        # if (cur_col, cur_row) not in v2l:
+        #     if v2l:
+        #         cur_col = min(cur_col, len(text_grid) - 1)
+        #         cur_row = min(cur_row, len(text_grid[cur_col]) - 1 if text_grid[cur_col] else 0)
+        #     else:
+        #         cur_col, cur_row = 0, 0
+
+        # 物理坐标越界保护
+        if not cursor_restored:
+            cur_col, cur_row, = l2v.get((init_p_idx, init_c_idx), (0, 0))
+            desired_row = cur_row
+            cursor_restored = True
+        elif (cur_col, cur_row) not in v2l:
             if v2l:
                 cur_col = min(cur_col, len(text_grid) - 1)
                 cur_row = min(cur_row, len(text_grid[cur_col]) - 1 if text_grid[cur_col] else 0)
@@ -366,7 +401,7 @@ def main(stdscr):
             attr = curses.A_REVERSE | curses.A_BOLD
         else:
             mode_str = "[NORMAL]" if current_mode == "NORMAL" else "[INSERT]"
-            info_str = f" {mode_str} {filename} | 窗口({cur_col},{cur_row}) | [u]撤销 [F2]保存 "
+            info_str = f" {mode_str} {vpad_filename} | 窗口({cur_col},{cur_row}) | [u]撤销 [F2]保存 "
 
         render_status_bar(stdscr, max_y, max_x, info_str,
                           curses.A_REVERSE | curses.A_BOLD if current_mode == "INSERT" else curses.A_REVERSE)
@@ -411,9 +446,15 @@ def main(stdscr):
         except curses.error:
             continue
 
+        # if isinstance(char, int) and char == curses.KEY_F2:
+        #     save_document(document, filename)
+        #     status_msg, status_timer = f"[成功保存至 {filename}]", 3
+        #     continue
+
         if isinstance(char, int) and char == curses.KEY_F2:
-            save_document(document, filename)
-            status_msg, status_timer = f"[成功保存至 {filename}]", 3
+            logical_pos = v2l.get((cur_col, cur_row), (0, 0))
+            sandbox.commit_and_pack(document, logical_pos[0], logical_pos[1])
+            status_msg, status_timer = f"「成功保存至 {vpad_filename}」", 3
             continue
 
         def move_cursor(d_col, d_row, is_absolute=False):
@@ -509,29 +550,42 @@ def main(stdscr):
                         # 检查 document 是否 dirty，但偷个小懒直接退，以后再处理
                         break
                     elif cmd == 'w':
-                        save_document(document, filename)
-                        status_msg, status_timer = "「已保存」", 3
+                        logical_pos = v2l.get((cur_col, cur_row), (0, 0))
+                        sandbox.commit_and_pack(document, logical_pos[0], logical_pos[1])
+                        status_msg, status_timer = "「已落盘至 .vpad」", 3
                         current_mode = "NORMAL"
                     elif cmd == 'wq':
-                        save_document(document, filename)
+                        logical_pos = v2l.get((cur_col, cur_row), (0, 0))
+                        sandbox.commit_and_pack(document, logical_pos[0], logical_pos[1])
                         break
                     elif cmd == 'q!':
                         break
                     elif cmd.startswith('!'):
                         shell_cmd = cmd[1:].strip()
-                        shell_cmd = shell_cmd.replace('%', filename)
+                        physical_file = sandbox.get_bak_path()
+                        shell_cmd = shell_cmd.replace('%', physical_file)
+                        sandbox.sync_to_tmp(document, force=True)
 
-                        # 强制保存，确保 Vim 读取最新文件
-                        save_document(document, filename)
-                        # 挂起 vpad 的 curses 界面
+                        if sandbox.f_tmp.exists():
+                            os.replace(sandbox.f_tmp, sandbox.f_bak)
                         curses.endwin()
-                        # 阻塞执行 Vim, vpad 进程会在这里停滞，直到在 Vim 里执行 :wq 退出
-                        os.system(shell_cmd)
-                        # Vim 退出后，vpad 重新接管终端并清空屏幕
+                        sys.stdout.flush()
+
+                        import subprocess # 用于安全地调用 Vim
+                        subprocess.run(shell_cmd, shell=True)
+                        # 外部程序退出，重新回到 vpad
                         stdscr.clear()
-                        stdscr.refresh()
-                        document = load_document(filename)
-                        status_msg, status_timer = f"「已同步 {shell_cmd.split()[0]} 的修改」", 3
+                        curses.doupdate()
+                        # 更新 Hash，接受外部程序可能做出的修改
+                        sandbox.sync_after_vim()
+                        document = load_document(physical_file)
+                        text_grid, l2v, v2l = build_global_layout(document, usable_height)
+
+                        # 游标强行归零（保证文本安全，避免 vpad 重新接管后游标彻底混乱）
+                        cur_col, cur_row, desired_row, camera_col = 0, 0, 0, 0
+                        cursor_restored = False
+                        cmd_name = shell_cmd.split()[0] if shell_cmd else "外部命令"
+                        status_msg, status_timer = f"「已同步 {cmd_name} 的修改」", 3
                         current_mode = "NORMAL"
                     else:
                         status_msg, status_timer = f"「未知命令: {cmd}」", 3
@@ -586,7 +640,9 @@ def main(stdscr):
                         text_grid, l2v, v2l = build_global_layout(document, usable_height)
                         cur_col, cur_row = l2v.get(expected_logical, (cur_col, cur_row))
                         desired_row = cur_row
-
+                        # .vpad 文件的防灾机制
+                        sandbox.sync_to_tmp(document)
+    sandbox.cleanup()
 if __name__ == "__main__":
     os.environ.setdefault('TERM', 'xterm-256color')
     curses.wrapper(main)
